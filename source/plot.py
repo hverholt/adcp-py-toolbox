@@ -119,8 +119,8 @@ def get_plot_args(plot_type, cy='ENU'):
         names = variables
         
     if plot_type == 'amplitude':
-        variables = ['A1','A2','A3','A4','A5']
-        names = ['Beam 1', 'Beam 2', 'Beam 3', 'Beam 4', 'Beam 5']
+        variables = ['A1','A2','A3','A4']
+        names = ['Beam 1', 'Beam 2', 'Beam 3', 'Beam 4']
     
     if plot_type == 'correlation':
         variables = ['C1','C2','C3','C4']
