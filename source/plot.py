@@ -1,9 +1,13 @@
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 import datetime as dt
 import numpy as np
 import pandas as pd
 import re
+
+
+plt.rcParams['font.family'] = 'Arial'
 
 
 def resolve_key(key, index, name):
@@ -23,15 +27,6 @@ def resolve_plot_type(plot_type):
     return resolve_key(plot_type, plot_types, 'plot_type')
 
 
-def get_time_xlim1(xlim, xref):
-    xlim = np.asarray(xlim)
-    xref = np.asarray(xref)
-    unit = np.datetime_data(xref.dtype)[0]
-    xlim = xlim.astype(f'timedelta64[{unit}]')
-    
-    return xlim + xref
-
-
 def get_time_xlim(xlim, xref):
     xlim = np.asarray(xlim)
     xref = np.asarray(xref)
@@ -41,7 +36,7 @@ def get_time_xlim(xlim, xref):
         if all(isinstance(x, (np.datetime64, dt.datetime, pd.Timestamp)) for x in xlim):
             xlim = xlim.astype('datetime64[ns]')
 
-    # If already datetime64, return as-is
+    # If already datetime64, do not do anything
     if np.issubdtype(xlim.dtype, np.datetime64):
         return xlim
 
@@ -59,7 +54,7 @@ def rescale_ylim_to_visible_data(ax, x_mode):
 
     if x_mode == 'time':
         # Convert float xlim to datetime64
-        xlim = mdates.num2date(xlim)  # gives Python datetime
+        xlim = mdates.num2date(xlim)
         xlim = np.array(xlim).astype('datetime64[ns]')
 
     ymin, ymax = np.inf, -np.inf
@@ -98,6 +93,18 @@ def get_y_data(y_mode, ds):
     return y, y_mode
 
 
+def set_degree_ticks(ax):
+    ymin, ymax = ax.get_ylim()
+    span = abs(ymax - ymin)
+
+    if span > 90:
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(90))
+        ax.yaxis.set_minor_locator(mticker.MultipleLocator(30))
+    else:
+        ax.yaxis.set_major_locator(mticker.AutoLocator())
+        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
+
+
 def get_plot_args(plot_type, cy='ENU'):
     # Convert to string
     plot_type = resolve_plot_type(plot_type)
@@ -112,8 +119,8 @@ def get_plot_args(plot_type, cy='ENU'):
         names = variables
         
     if plot_type == 'amplitude':
-        variables = ['A1','A2','A3','A4']
-        names = ['Beam 1', 'Beam 2', 'Beam 3', 'Beam 4']
+        variables = ['A1','A2','A3','A4','A5']
+        names = ['Beam 1', 'Beam 2', 'Beam 3', 'Beam 4', 'Beam 5']
     
     if plot_type == 'correlation':
         variables = ['C1','C2','C3','C4']
@@ -144,7 +151,7 @@ def average_pixels(arr, xpixavg=1, ypixavg=1):
 
     arr_cropped = arr[:ny_crop, :nx_crop]
     reshaped = arr_cropped.reshape(ny_crop // ypixavg, ypixavg, nx_crop // xpixavg, xpixavg)
-    block_avg = reshaped.mean(axis=(1, 3))
+    block_avg = np.nanmean(reshaped, axis=(1, 3))
     upscaled = np.kron(block_avg, np.ones((ypixavg, xpixavg)))
 
     # Pad to original size
@@ -154,9 +161,11 @@ def average_pixels(arr, xpixavg=1, ypixavg=1):
     return result.squeeze() if is_1d else result
 
 
-def plot_beam_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None, clim=None, 
-                   cmap='viridis', plot_only=None, xpixavg=1, ypixavg=1, dpi=150,
-                   datefmt='%H:%M'):
+def plot_beam_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None,
+                   clim=None, cmap='viridis', subplot_indices=None, 
+                   xpixavg=1, ypixavg=1, corr_threshold=None, 
+                   dpi=150, datefmt='%H:%M'):
+    
     # Get x and y data
     x, x_mode = get_x_data(x_mode, ds)
     y, y_mode = get_y_data(y_mode, ds)
@@ -167,14 +176,53 @@ def plot_beam_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None, clim
     # Get variables and names
     variables, names, plot_type = get_plot_args(plot_type, cy)
 
-    # Filter by plot_only
-    if plot_only is not None:
-        variables = [variables[i] for i in range(len(variables)) if i in plot_only]
-        names = [names[i] for i in range(len(names)) if i in plot_only]
+    # Apply correlation threshold
+    masks = [None] * len(variables)
+    if corr_threshold is not None:
+        
+        # Raise an error in case of invalid threshold value
+        if not 0 <= corr_threshold <= 100:    
+            raise ValueError(
+                'Invalid value for corr_threshold; '
+                'valid values are 0 <= corr_threshold <= 100'
+            )
+            
+        corr_variables, _, _ = get_plot_args('correlation')
+
+        # If coords are BEAM then each beam velocity has its own correlations
+        if cy == 'BEAM':
+            masks = [
+                ds[corr_var].values < corr_threshold
+                for corr_var in corr_variables
+            ]
+        # If coords are XYZ/ENU then velocities depend on all beam correlations
+        else:
+            corr = np.stack(
+                [ds[var].values for var in corr_variables],
+                axis=0
+            )
+            mask = np.any(corr < corr_threshold, axis=0)
+            masks = [mask] * len(variables)
+            
+    # Filter by subplot_indices
+    if subplot_indices is not None:
+        variables = [variables[i] for i in subplot_indices]
+        names = [names[i] for i in subplot_indices]
+        masks = [masks[i] for i in subplot_indices]
+
     N_plots = len(variables)
 
+    # Get data, applying correlation masks
+    all_data = []
+    for var, mask in zip(variables, masks):
+        Z = ds[var].values.astype(float, copy=True)
+
+        if mask is not None:
+            Z[mask] = np.nan
+
+        all_data.append(Z)
+    
     # Compute cmin/cmax
-    all_data = [ds[var].values for var in variables]
     if clim is None:
         cmin = min(np.nanmin(Z) for Z in all_data)
         cmax = max(np.nanmax(Z) for Z in all_data)
@@ -185,29 +233,41 @@ def plot_beam_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None, clim
             cmin, cmax = -clim, clim
     
     # Define figure and axes
-    fig, axs = plt.subplots(N_plots, 1, figsize=(8, 2 * N_plots), dpi=dpi, sharex=True)
+    fig, axs = plt.subplots(
+        N_plots, 1,
+        figsize=(8, 2 * N_plots),
+        dpi=dpi,
+        sharex=True
+    )
     axs = np.atleast_1d(axs)
 
-    # Plot each subplot
+    # Loop over each subplot
     cmeshes = []
-    for i, (var, name) in enumerate(zip(variables, names)):
+    for i, (Z, name) in enumerate(zip(all_data, names)):
         ax = axs[i]
-        Z = ds[var].T
-        Z = average_pixels(Z.values, xpixavg, ypixavg)
-        cmesh = ax.pcolormesh(x, y, Z, vmin=cmin, vmax=cmax, cmap=cmap)
+        Z = Z.T
+        Z = average_pixels(Z, xpixavg, ypixavg)
+
+        # Plot data
+        cmesh = ax.pcolormesh(
+            x, y, Z,
+            vmin=cmin,
+            vmax=cmax,
+            cmap=cmap
+        )
         cmeshes.append(cmesh)
     
         # Set xlabel
         if x_mode == 'index':
-            ax.set_xlabel('Number of measurement')
+            ax.set_xlabel('Number of measurement', fontsize=12)
         elif x_mode == 'time':
             ax.xaxis.set_major_formatter(mdates.DateFormatter(datefmt))
 
         # Set ylabel
         if y_mode == 'cell':
-            ax.set_ylabel('Cell number')
+            ax.set_ylabel('Cell number', fontsize=12)
         elif y_mode == 'range':
-            ax.set_ylabel('Range (m)')
+            ax.set_ylabel('Range (m)', fontsize=12)
 
         # Set ylimit
         if ylim is not None:
@@ -218,13 +278,13 @@ def plot_beam_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None, clim
         ax.set_title(name, loc='left', fontsize=13)
         ax.set_aspect('auto')
 
-    # Set xlimit (once is enough)
+    # Set xlimit
     if xlim is not None:
         if x_mode == 'time':
             xlim = get_time_xlim(xlim, x[-1])
         ax.set_xlim(*xlim)
 
-    # Determine if clim exceeds data extent, in which case, add 'extend' indicators
+    # Add extend indicators to cbar
     all_min = np.nanmin([np.nanmin(Z) for Z in all_data])
     all_max = np.nanmax([np.nanmax(Z) for Z in all_data])
     extend = (
@@ -247,16 +307,16 @@ def plot_beam_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None, clim
         label += ' (dB)'
     if plot_type == 'correlation':
         label += ' (%)'
-    cbar.set_label(label=label, size=13)
+    cbar.set_label(label=label, fontsize=12)
 
     plt.close(fig)
+    
     return fig
 
 
-def plot_sensor_data(ds, plot_type, x_mode=0, xlim=None, ylim=None, xpixavg=1, dpi=150, 
+def plot_sensor_data(ds, plot_type, x_mode=0, xlim=None, ylim=None,
+                     xpixavg=1, wrap_roll=False, dpi=150,
                      datefmt='%H:%M', grid=False):
-    orientation_colors = ['k', 'r', 'g']
-    PT_colors = ['tab:blue', 'tab:orange']
     
     # Helper function
     def configure_ax(ax, gridcolor='gray'):
@@ -270,18 +330,29 @@ def plot_sensor_data(ds, plot_type, x_mode=0, xlim=None, ylim=None, xpixavg=1, d
         if ylim is not None:
             ax.set_ylim(*ylim)
 
+        # Grid and ticks
         ax.minorticks_on()
         if grid:
-            ax.grid(alpha=0.3, lw=1, color=gridcolor)
-    
+            ax.grid(axis='y', alpha=0.2, lw=1,
+                    color=gridcolor, zorder=-1)
+            ax.grid(axis='x', alpha=0.2, lw=1,
+                    color='gray', zorder=-1)
+
+
     # Get x data
     x, x_mode = get_x_data(x_mode, ds)
 
     # Get variables and names
     variables, names, plot_type = get_plot_args(plot_type)
 
+    # Define colors
+    orientation_colors = ['k', 'r', 'g']
+    PT_colors = ['tab:blue', 'tab:orange']
+
     
+    # -------------------------------------
     # ORIENTATION
+    # -------------------------------------
     if plot_type == 'orientation':
         fig = plt.figure(figsize=(8, 2), dpi=dpi)
         ax = fig.add_subplot()
@@ -289,16 +360,30 @@ def plot_sensor_data(ds, plot_type, x_mode=0, xlim=None, ylim=None, xpixavg=1, d
         # Plot heading, pitch, roll data
         for i, (var, name) in enumerate(zip(variables, names)):
             color = orientation_colors[i]
-            y = ds[var]
-            y = average_pixels(y.values, xpixavg)
-            ax.plot(x, y, color=color, label=name)
-            configure_ax(ax)
+            y = ds[var].values
+            # Flip roll values by 180°
+            if wrap_roll and name == 'Roll':
+                y = y % 360
+            # Apply pixel averaging
+            y = average_pixels(y, xpixavg)
 
-        ax.legend()
-        ax.set_ylabel('Degrees (°)')
+            # Plot data
+            ax.plot(x, y, color=color, label=name, alpha=0.6, zorder=2)
+            
+        configure_ax(ax)
+        set_degree_ticks(ax)
+
+        ax.legend(
+            loc='center left',
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0,
+        )
+        ax.set_ylabel('Degrees (°)', fontsize=12)
 
     
+    # -------------------------------------
     # PRESSURE AND TEMPERATURE
+    # -------------------------------------
     if plot_type == 'PT':
         fig = plt.figure(figsize=(8, 2), dpi=dpi)
         ax1 = fig.add_subplot()
@@ -308,48 +393,75 @@ def plot_sensor_data(ds, plot_type, x_mode=0, xlim=None, ylim=None, xpixavg=1, d
         for i, (var, ax) in enumerate(zip(variables, (ax1, ax2))):
             color = PT_colors[i]
             y = ds[var]
-            y = average_pixels(y.values, xpixavg)
-            ax.plot(x, y, color=color)
+            # Apply pixel averaging
+            y = average_pixels(y, xpixavg)
+
+            # Plot data
+            ax.plot(x, y, color=color, alpha=0.9, zorder=2)
             configure_ax(ax, gridcolor=color)
 
-        ax1.set_ylabel('Pressure (dBar)', color=PT_colors[0])
+        ax1.set_ylabel('Pressure (dBar)', color=PT_colors[0], fontsize=12)
         ax1.tick_params(which='both', axis='y', colors=PT_colors[0])
-        ax2.set_ylabel('Temperature (°C)', color=PT_colors[1])
+        ax2.set_ylabel('Temperature (°C)', color=PT_colors[1], fontsize=12)
         ax2.tick_params(which='both', axis='y', colors=PT_colors[1])
 
-
+    
+    # -------------------------------------
     # ORIENTATION, PRESSURE AND TEMPERATURE
-    if plot_type in ['orientation+PT']:
+    # -------------------------------------
+    if plot_type == 'orientation+PT':
         fig, axs = plt.subplots(2, 1, figsize=(8, 4), dpi=dpi, sharex=True)
 
+        # -  -  -  -  -  -  -  -  -  -  -  -  -
         # Plot heading, pitch, roll data
+        # -  -  -  -  -  -  -  -  -  -  -  -  -
         ax = axs[0]
         for i, (var, name) in enumerate(zip(variables[:3], names[:3])):
             color = orientation_colors[i]
-            y = ds[var]
-            y = average_pixels(y.values, xpixavg)
-            ax.plot(x, y, color=color, label=name)
-            configure_ax(ax)
+            y = ds[var].values
+            # Flip roll values by 180°
+            if wrap_roll and name == 'Roll':
+                y = y % 360
+            # Apply pixel averaging
+            y = average_pixels(y, xpixavg)
 
-        ax.legend()
-        ax.set_ylabel('Degrees (°)')
+            # Plot data
+            ax.plot(x, y, color=color, label=name, alpha=0.6, zorder=2)
+        
+        configure_ax(ax)
+        set_degree_ticks(ax)
+        
+        ax.legend(
+            loc='center left',
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0,
+        )
+        ax.set_ylabel('Degrees (°)', fontsize=12)
         ax.set_title('Orientation', loc='left', fontsize=13)
 
+        # -  -  -  -  -  -  -  -  -  -  -  -  -
         # Plot pressure and temperature
+        # -  -  -  -  -  -  -  -  -  -  -  -  -
         ax1 = axs[1]
         ax2 = ax1.twinx()
         for i, (var, ax) in enumerate(zip(variables[3:], (ax1, ax2))):
             color = PT_colors[i]
-            y = ds[var]
-            y = average_pixels(y.values, xpixavg)
-            ax.plot(x, y, color=color)
+            y = ds[var].values
+            # Apply pixel averaging
+            y = average_pixels(y, xpixavg)
+            
+            # Plot data
+            ax.plot(x, y, color=color, alpha=0.9, zorder=2)
             configure_ax(ax, gridcolor=color)
 
-        ax1.set_ylabel('Pressure (dBar)', color=PT_colors[0])
+        ax1.set_ylabel('Pressure (dBar)', color=PT_colors[0], fontsize=12)
         ax1.tick_params(which='both', axis='y', colors=PT_colors[0])
-        ax2.set_ylabel('Temperature (°C)', color=PT_colors[1])
+        ax2.set_ylabel('Temperature (°C)', color=PT_colors[1], fontsize=12)
         ax2.tick_params(which='both', axis='y', colors=PT_colors[1])
         ax.set_title('Pressure & temperature', loc='left', fontsize=13)
+
+    
+    # -------------------------------------
     
     # Set xlimit
     if xlim is not None:
@@ -358,21 +470,28 @@ def plot_sensor_data(ds, plot_type, x_mode=0, xlim=None, ylim=None, xpixavg=1, d
         ax.set_xlim(*xlim)
         rescale_ylim_to_visible_data(ax, x_mode)
     
-    fig.tight_layout()
     plt.close(fig)
+
     return fig
         
 
-def plot_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None, clim=None, cmap='viridis', 
-              plot_only=None, xpixavg=1, ypixavg=1, dpi=150, datefmt='%H:%M', grid=False):
+def plot_data(ds, plot_type, x_mode=0, y_mode=0, xlim=None, ylim=None,
+              clim=None, cmap='viridis', subplot_indices=None, 
+              xpixavg=1, ypixavg=1, corr_threshold=None,
+              wrap_roll=False, dpi=150, datefmt='%H:%M',
+              grid=False):
+    # Get plot type
+    plot_type = resolve_plot_type(plot_type)
+    
     # Beam data
-    if plot_type in [0,1,2]:
-        fig = plot_beam_data(ds, plot_type, x_mode, y_mode, xlim, ylim, clim, 
-                             cmap, plot_only, xpixavg, ypixavg, dpi, datefmt)
+    if plot_type in ['velocity','amplitude','correlation']:
+        fig = plot_beam_data(ds, plot_type, x_mode, y_mode, xlim, ylim, 
+                             clim, cmap, subplot_indices, xpixavg, ypixavg,
+                             corr_threshold, dpi, datefmt)
     # Plot sensor data
-    if plot_type in [3,4,5]:
-        fig = plot_sensor_data(ds, plot_type, x_mode, xlim, ylim, xpixavg, dpi,
-                               datefmt, grid)
+    if plot_type in ['orientation','PT','orientation+PT']:
+        fig = plot_sensor_data(ds, plot_type, x_mode, xlim, ylim, xpixavg,
+                               wrap_roll, dpi, datefmt, grid)
     
     return fig
 
