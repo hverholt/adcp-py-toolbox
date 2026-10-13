@@ -46,6 +46,10 @@ def read_tm_file_to_dict(ifile):
         if not match:
             continue
         identifier, fields, checksum = match.group(1), match.group(2), match.group(3)
+
+        # Only process actual telemetry records
+        if identifier not in ("PNORI", "PNORS", "PNORC"):
+            continue
         
         # If telemetry contains keys, use keys
         if '=' in fields:
@@ -67,7 +71,7 @@ def assign_keys(data_dict, data_format):
     for outer_key, inner_dict in data_dict.items():
         # Check if all inner keys are integers
         if all(isinstance(k, int) for k in inner_dict):
-            mapped_dict = {data_format.keys()[i]: v for i, v in inner_dict.items()}
+            mapped_dict = {data_format[outer_key][i]: v for i, v in inner_dict.items()}
         # Else leave as is
         else:
             mapped_dict = inner_dict
@@ -122,11 +126,15 @@ def dict_to_xrdataset(data_dict):
 
 def assign_dtypes(ds, dtypes, fill=None):
     for col in ds.variables:
-        if col in dtypes.keys():
-            ds[col] = ds[col].astype(dtypes[col])
-        else:
-            if fill:
-                ds[col] = ds[col].astype(fill)
+        dtype = dtypes.get(col, fill)
+
+        if dtype is not None:
+            try:
+                ds[col] = ds[col].astype(dtype)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Cannot convert variable '{col}' to {dtype}: {e}"
+                ) from e
 
 
 def remove_errors(ds, error_values):
@@ -155,7 +163,7 @@ def telemetry_to_netcdf(ifile, ofile, data_format, error_values=error_values, fi
 
     tm_data_dict = assign_keys(
         tm_data_dict,
-        data_format
+        data_format_dict
     )
     tm_ds = dict_to_xrdataset(tm_data_dict)
 
