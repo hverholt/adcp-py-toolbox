@@ -48,7 +48,11 @@ def read_tm_file_to_dict(ifile):
         identifier, fields, checksum = match.group(1), match.group(2), match.group(3)
 
         # Only process actual telemetry records
-        if identifier not in ("PNORI", "PNORS", "PNORC"):
+        for prefix in ("PNORI", "PNORS", "PNORC"):
+            if identifier.startswith(prefix):
+                identifier = prefix
+                break
+        else:
             continue
         
         # If telemetry contains keys, use keys
