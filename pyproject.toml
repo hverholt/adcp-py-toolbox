@@ -16,6 +16,9 @@ dependencies = [
     "pyserial",
 ]
 
+[project.scripts]
+adcp-telemetry2netcdf = "adcp_toolbox.telemetry2netcdf:main"
+
 [project.optional-dependencies]
 notebooks = [
     "PyAutoGUI",

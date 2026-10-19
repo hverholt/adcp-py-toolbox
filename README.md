@@ -20,6 +20,16 @@ from adcp_toolbox import ad2cp, plot
 
 Example workflows are available in `notebooks/`.
 
+### Convert telemetry to NetCDF
+
+The package also converts Nortek Signature telemetry files to NetCDF:
+
+```bash
+adcp-telemetry2netcdf input.txt output.nc
+```
+
+Defaults to NMEA format 102 with error filtering. Use `--data-format 100` or `--data-format 101` for other formats, or `--no-filter-errors` to retain error values.
+
 ## Development
 
 To modify the package locally, clone the repository and install it in editable mode with notebook dependencies:

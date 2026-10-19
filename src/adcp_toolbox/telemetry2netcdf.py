@@ -1,6 +1,6 @@
 import argparse
 import re
-import os
+from pathlib import Path
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -150,8 +150,6 @@ def order_xrdataset_by_coords(ds):
 
 
 def export_xrdataset_to_netcdf(ds, ofile):
-    #filename = os.path.basename(ifile).rpartition('.')[0]
-    #ofile = f'data/formatted/{filename}.nc'
     ds.to_netcdf(ofile)
 
 
@@ -189,14 +187,52 @@ def telemetry_to_netcdf(ifile, ofile, data_format, error_values=error_values, fi
     return ofile
 
 
-if __name__ == '__main__':
-    data_format = 102
-    parser = argparse.ArgumentParser(description='Convert telemetry TXT file to NetCDF.')
-    #parser.add_argument('data_format', help='Telemetry NMEA data format')
-    parser.add_argument('input_txt', help='Path to input TXT file')
-    parser.add_argument('output_nc', help='Path to output NetCDF file')
-    args = parser.parse_args()
-    
-    ofile = telemetry_to_netcdf(args.input_txt, args.output_nc, data_format, filter_errors=True)
-    
-    print(f'Conversion completed. File saved to {ofile}')
+def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point for Nortek Signature telemetry conversion."""
+    parser = argparse.ArgumentParser(
+        description="Convert Nortek Signature ADCP telemetry TXT files to NetCDF.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "input_txt", type=Path,
+        help="Input telemetry text file.",
+    )
+    parser.add_argument(
+        "output_nc", nargs="?", type=Path,
+        help="Output NetCDF file (defaults to the input filename with a .nc suffix).",
+    )
+    parser.add_argument(
+        "--data-format", type=int, choices=(100, 101, 102), default=102,
+        help="Nortek telemetry data format.",
+    )
+    parser.add_argument(
+        "--filter-errors", action=argparse.BooleanOptionalAction, default=True,
+        help="Replace known invalid measurement values with NaN.",
+    )
+    args = parser.parse_args(argv)
+
+    input_path = args.input_txt.expanduser()
+    output_path = (args.output_nc or input_path.with_suffix(".nc")).expanduser()
+
+    if not input_path.is_file():
+        parser.error(f"Input file not found: {input_path}")
+    if input_path.resolve() == output_path.resolve():
+        parser.error("Input and output paths must differ.")
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        telemetry_to_netcdf(
+            ifile=input_path,
+            ofile=output_path,
+            data_format=args.data_format,
+            filter_errors=args.filter_errors,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        parser.exit(1, f"Conversion failed: {exc}\n")
+
+    print(f"Saved NetCDF: {output_path.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
