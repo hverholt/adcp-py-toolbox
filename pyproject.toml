@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adcp-py-toolbox"
+version = "0.1.0"
+description = "Python tools for ADCP data reading, processing, visualization, and telemetry."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "xarray",
+    "matplotlib",
+    "mhkit",
+    "pyserial",
+]
+
+[project.optional-dependencies]
+notebooks = [
+    "PyAutoGUI",
+    "ipykernel",
+    "jupyterlab",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["adcp_toolbox*"]
