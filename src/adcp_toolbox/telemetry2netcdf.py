@@ -82,10 +82,8 @@ def _parse_row(kind, fields, layout, keyed):
     for key, value in row.items():
         if key in ("DATE", "TIME") or key in processed_data_dtypes:
             continue
-        if value == "":
+        if value == "" or not math.isfinite(float(value)):
             row[key] = np.nan
-        elif not math.isfinite(float(value)):
-            raise ValueError(f"non-finite {key}")
     return row
 
 
