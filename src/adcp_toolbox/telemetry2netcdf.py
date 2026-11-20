@@ -1,4 +1,8 @@
 import argparse
+import logging
+import math
+from datetime import datetime
+from functools import lru_cache
 import re
 from pathlib import Path
 import numpy as np
@@ -35,38 +39,93 @@ processed_data_dtype_fill = float
 error_values = [-32.768,-9,-99,-999,-9999]
 
 
-def read_tm_file_to_dict(ifile):
-    with open(ifile, 'r') as f:
-        lines = f.readlines()
-    data_dict = defaultdict(lambda: defaultdict(list))
-    
-    # Interpret lines
-    for line in lines:
-        match = re.match(r'\$(\w+),(.*)\*(\w+)', line.strip())
-        if not match:
-            continue
-        identifier, fields, checksum = match.group(1), match.group(2), match.group(3)
+_sentence = re.compile(r"\$(PNORI|PNORS|PNORC)\d*,([^*$]+)\*([0-9a-fA-F]{2})")
+_log = logging.getLogger(__name__)
 
-        # Only process actual telemetry records
-        for prefix in ("PNORI", "PNORS", "PNORC"):
-            if identifier.startswith(prefix):
-                identifier = prefix
-                break
-        else:
-            continue
-        
-        # If telemetry contains keys, use keys
-        if '=' in fields:
-            for field in fields.split(','):
-                key, value = field.split('=', 1)
-                data_dict[identifier][key].append(value)
-        
-        # If telemetry contains no keys, use the index as keys
-        else:
-            for i, field in enumerate(fields.split(',')):
-                data_dict[identifier][i].append(field)
 
-    return data_dict
+@lru_cache(maxsize=256)
+def _check_time(date, time):
+    if len(date) != 6 or len(time) != 6:
+        raise ValueError("invalid date/time width")
+    datetime.strptime(date + time, "%m%d%y%H%M%S")
+
+
+def _parse_row(kind, fields, layout, keyed):
+    names = layout[kind]
+    if len(fields) != len(names):
+        raise ValueError(f"{len(fields)} fields, expected {len(names)}")
+    row = {}
+    for index, field in enumerate(fields):
+        if keyed:
+            if field.count("=") != 1:
+                raise ValueError("invalid key=value field")
+            key, value = field.split("=")
+        else:
+            key, value = names[index], field
+        if key in row:
+            raise ValueError(f"duplicate {key}")
+        row[key] = value
+
+    # Nortek names velocity components according to the coordinate system.
+    expected = set(names)
+    if kind == "PNORC":
+        expected.difference_update(("V1", "V2", "V3", "V4"))
+        components = set(row) - expected
+        if len(components) != 4 or not all(re.fullmatch(r"V[A-Z0-9]+", k) for k in components):
+            raise ValueError("invalid velocity component keys")
+    if not expected.issubset(row):
+        raise ValueError("missing required field names")
+    if kind != "PNORI":
+        _check_time(row["DATE"], row["TIME"])
+    if kind == "PNORC" and (not row["CN"].isdigit() or int(row["CN"]) < 1):
+        raise ValueError("invalid cell number")
+    for key, value in row.items():
+        if key in ("DATE", "TIME") or key in processed_data_dtypes:
+            continue
+        if value == "":
+            row[key] = np.nan
+        elif not math.isfinite(float(value)):
+            raise ValueError(f"non-finite {key}")
+    return row
+
+
+def read_tm_file_to_dict(ifile, data_format=None):
+    """Validate each whole record before committing its fields to columns."""
+    columns = defaultdict(lambda: defaultdict(list))
+    skipped = 0
+    examples = []
+    with open(ifile, encoding="ascii", errors="replace") as source:
+        for number, line in enumerate(source, 1):
+            line = line.strip()
+            if not line.startswith(("$PNORI", "$PNORS", "$PNORC")):
+                continue
+            try:
+                match = _sentence.fullmatch(line)
+                if not match:
+                    raise ValueError("incomplete or malformed sentence")
+                kind, payload, _ = match.groups()
+                fields = payload.split(",")
+                keyed = "=" in payload
+                layout = data_format
+                if layout is None:
+                    layout = (NMEA_FORMAT_100 if len(fields) == len(NMEA_FORMAT_100[kind])
+                              else NMEA_FORMAT_101_102)
+                row = _parse_row(kind, fields, layout, keyed)
+                if not keyed and data_format is None:
+                    row = dict(enumerate(row.values()))
+                table = columns[kind]
+                if table and table.keys() != row.keys():
+                    raise ValueError("field names changed within file")
+            except ValueError as exc:
+                skipped += 1
+                if len(examples) < 10:
+                    examples.append(f"line {number}: {exc}")
+                continue
+            for key, value in row.items():
+                table[key].append(value)
+    if skipped:
+        _log.warning("Skipped %d malformed telemetry records (%s)", skipped, "; ".join(examples))
+    return columns
 
 
 def assign_keys(data_dict, data_format):
@@ -113,9 +172,15 @@ def dict_to_xrdataset(data_dict):
 
         # Merge columns into xr.Dataset
         if indexes:
+            if "CN" in indexes:
+                df["CN"] = pd.to_numeric(df["CN"])
+            repeated = df.duplicated(indexes, keep="first")
+            if repeated.any():
+                _log.warning("Ignoring %d repeated %s records; keeping first", repeated.sum(), key)
+                df = df.loc[~repeated]
             df = df.reset_index(drop=True).set_index(indexes)
             ds_part = df.to_xarray()
-            ds = ds.merge(ds_part)
+            ds = ds.merge(ds_part, join="outer")
 
         # Add each column to the xr.Dataset
         else:
@@ -123,7 +188,7 @@ def dict_to_xrdataset(data_dict):
                 if len(df[col]) == len(ds['TIME']):
                     ds[col] = (('TIME'), df[col])
                 else:
-                    ds[col] = df[col]
+                    ds[col] = ("PNORI_record", df[col].to_numpy())
 
     return ds
 
@@ -154,7 +219,6 @@ def export_xrdataset_to_netcdf(ds, ofile):
 
 
 def telemetry_to_netcdf(ifile, ofile, data_format, error_values=error_values, filter_errors=False):
-    tm_data_dict = read_tm_file_to_dict(ifile)
     
     if data_format == 100:
         data_format_dict = NMEA_FORMAT_100
@@ -163,10 +227,9 @@ def telemetry_to_netcdf(ifile, ofile, data_format, error_values=error_values, fi
     else:
         raise ValueError(f'{repr(data_format)} is not a valid value for data_format; available values are: 100, 101, 102')
 
-    tm_data_dict = assign_keys(
-        tm_data_dict,
-        data_format_dict
-    )
+    tm_data_dict = read_tm_file_to_dict(ifile, data_format_dict)
+    if not tm_data_dict.get("PNORC") and not tm_data_dict.get("PNORS"):
+        raise ValueError("No usable timestamped telemetry records.")
     tm_ds = dict_to_xrdataset(tm_data_dict)
 
     assign_dtypes(
